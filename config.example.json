@@ -1,0 +1,33 @@
+{
+  "$schema": "./config.schema.json",
+  "server_url": "https://photos.example.com/api",
+  "watch_folders": [],
+  "upload_options": {
+    "recursive": true,
+    "concurrency": 4,
+    "album": false,
+    "album_name": null,
+    "ignore_patterns": [],
+    "include_hidden": false,
+    "dry_run": false,
+    "skip_hash": false
+  },
+  "watch_mode": {
+    "enabled": false,
+    "debounce_ms": 5000
+  },
+  "sync_triggers": {
+    "wifi_only": false,
+    "allowed_networks": [],
+    "require_plugged_in": false,
+    "schedule": {
+      "enabled": false,
+      "start_hour": 22,
+      "end_hour": 6
+    }
+  },
+  "cli_path": null,
+  "use_credential_manager": true,
+  "start_minimized": false,
+  "setup_complete": false
+}

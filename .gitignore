@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+dist/
+dist-ssr/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Local env & secrets — NEVER commit these
+.env
+.env.*
+*.local
+auth.yml
+config.json
+credentials.json
+**/retry_queue.json
+**/conflicts.json
+
+# Tauri build output
+src-tauri/target/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# User app data (if symlinked for dev)
+ImmichDesktop/
