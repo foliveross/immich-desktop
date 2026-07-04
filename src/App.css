@@ -351,6 +351,35 @@ body {
   width: 100%;
 }
 
+.setup-card-wide {
+  max-width: 580px;
+}
+
+.discovery-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.discovery-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.step-content select {
+  display: block;
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: #e8eaed;
+  font-size: 0.95rem;
+}
+
+
 .setup-card h1 {
   margin: 0 0 0.5rem;
 }

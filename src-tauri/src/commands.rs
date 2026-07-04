@@ -1,16 +1,20 @@
 use crate::cli::{self, CliManager, FileActivity, ServerInfo, UploadProgress};
 use crate::config::{self, AppConfig};
+use crate::connection::{self, HandshakeResult};
 use crate::credentials;
+use crate::discovery::{self, DiscoveredServer};
+use crate::process_manager::ProcessManager;
 use crate::retry_queue::{ConflictStore, RetryQueue};
 use crate::sync_triggers::{self, SyncTriggerStatus};
 use crate::watch::{restart_watch, WatchService};
-use anyhow::Result;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
+
 pub struct AppState {
     pub cli_manager: Arc<CliManager>,
     pub watch_service: Arc<WatchService>,
+    pub process_manager: Arc<ProcessManager>,
 }
 
 #[tauri::command]
@@ -38,6 +42,13 @@ pub fn get_logs_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
+pub fn get_lock_file_path() -> Result<String, String> {
+    ProcessManager::lock_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn has_stored_credentials() -> bool {
     credentials::has_api_key()
 }
@@ -53,24 +64,49 @@ pub async fn clear_credentials() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn complete_setup(
+pub async fn discover_servers() -> Result<Vec<DiscoveredServer>, String> {
+    Ok(discovery::discover_servers().await)
+}
+
+#[tauri::command]
+pub async fn perform_handshake(server_url: String, api_key: String) -> Result<HandshakeResult, String> {
+    connection::handshake(&server_url, &api_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn finalize_setup(
     app: AppHandle,
     state: State<'_, AppState>,
     server_url: String,
     api_key: String,
 ) -> Result<ServerInfo, String> {
-    credentials::store_api_key(&api_key).map_err(|e| e.to_string())?;
+    let api_url = connection::normalize_api_url(&server_url);
 
-    let mut config = config::load_config().map_err(|e| e.to_string())?;
-    config.server_url = Some(server_url.clone());
-    config.setup_complete = true;
-    config::save_config(&config).map_err(|e| e.to_string())?;
-
-    let login_output = cli::run_login(&app, &server_url, &api_key)
+    let handshake = connection::handshake(&api_url, &api_key)
         .await
         .map_err(|e| e.to_string())?;
 
-    if config.watch_mode.enabled {
+    if !handshake.success {
+        return Err(format!(
+            "Handshake failed (HTTP {}): {}. Complete the handshake test before finalizing.",
+            handshake.status_code, handshake.message
+        ));
+    }
+
+    credentials::store_api_key(&api_key).map_err(|e| e.to_string())?;
+
+    let mut cfg = config::load_config().map_err(|e| e.to_string())?;
+    cfg.server_url = Some(api_url.clone());
+    cfg.setup_complete = true;
+    config::save_config(&cfg).map_err(|e| e.to_string())?;
+
+    let login_output = cli::run_login(&state.cli_manager, &api_url, &api_key)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if cfg.watch_mode.enabled {
         restart_watch(
             app.clone(),
             state.watch_service.clone(),
@@ -79,20 +115,98 @@ pub async fn complete_setup(
         .await;
     }
 
-    match cli::run_server_info(&app).await {
-        Ok(info) => Ok(info),
-        Err(_) => Ok(ServerInfo {
-            version: login_output.lines().next().unwrap_or("Connected").to_string(),
-            raw_output: login_output,
-        }),
-    }
+    Ok(ServerInfo {
+        version: handshake
+            .server_version
+            .unwrap_or_else(|| "Connected".to_string()),
+        raw_output: login_output,
+    })
 }
 
 #[tauri::command]
-pub async fn test_connection(app: AppHandle) -> Result<ServerInfo, String> {
-    cli::run_server_info(&app)
+pub async fn complete_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_url: String,
+    api_key: String,
+) -> Result<ServerInfo, String> {
+    let api_url = connection::normalize_api_url(&server_url);
+
+    let handshake = connection::handshake(&api_url, &api_key)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if !handshake.success {
+        return Err(format!(
+            "Handshake failed (HTTP {}): {}",
+            handshake.status_code, handshake.message
+        ));
+    }
+
+    credentials::store_api_key(&api_key).map_err(|e| e.to_string())?;
+
+    let mut cfg = config::load_config().map_err(|e| e.to_string())?;
+    cfg.server_url = Some(api_url.clone());
+    cfg.setup_complete = true;
+    config::save_config(&cfg).map_err(|e| e.to_string())?;
+
+    let login_output = cli::run_login(&state.cli_manager, &api_url, &api_key)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if cfg.watch_mode.enabled {
+        restart_watch(
+            app.clone(),
+            state.watch_service.clone(),
+            state.cli_manager.clone(),
+        )
+        .await;
+    }
+
+    Ok(ServerInfo {
+        version: handshake
+            .server_version
+            .unwrap_or_else(|| "Connected".to_string()),
+        raw_output: login_output,
+    })
+}
+
+#[tauri::command]
+pub async fn test_connection(
+    state: State<'_, AppState>,
+    server_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<ServerInfo, String> {
+    let cfg = config::load_config().map_err(|e| e.to_string())?;
+    let url = server_url
+        .or(cfg.server_url.clone())
+        .ok_or_else(|| "No server URL configured".to_string())?;
+    let key = if let Some(k) = api_key {
+        k
+    } else {
+        credentials::get_api_key()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No API key stored".to_string())?
+    };
+
+    let handshake = connection::handshake(&url, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !handshake.success {
+        return Err(format!(
+            "Connection test failed (HTTP {}): {}",
+            handshake.status_code, handshake.message
+        ));
+    }
+
+    match cli::run_server_info(&state.cli_manager).await {
+        Ok(info) => Ok(info),
+        Err(_) => Ok(ServerInfo {
+            version: handshake.server_version.unwrap_or_else(|| "OK".to_string()),
+            raw_output: handshake.message,
+        }),
+    }
 }
 
 #[tauri::command]
@@ -106,6 +220,10 @@ pub async fn start_upload(
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<(), String> {
+    if state.cli_manager.is_upload_running().await {
+        return Err("An upload is already in progress".to_string());
+    }
+
     let triggers = sync_triggers::evaluate_triggers(
         &config::load_config().map_err(|e| e.to_string())?.sync_triggers,
     );
@@ -260,4 +378,14 @@ pub fn open_logs_folder() -> Result<(), String> {
 pub fn open_config_folder() -> Result<(), String> {
     let dir = config::app_data_dir().map_err(|e| e.to_string())?;
     open::that(dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_cli_lock() -> Result<(), String> {
+    if let Ok(path) = ProcessManager::lock_path() {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }

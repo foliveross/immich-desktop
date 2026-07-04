@@ -1,5 +1,6 @@
 use crate::config::{self, AppConfig, UploadOptions};
 use crate::credentials;
+use crate::process_manager::{self, ProcessManager};
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -7,8 +8,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_shell::process::CommandEvent;
-use tauri_plugin_shell::ShellExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,24 +53,22 @@ pub struct ServerInfo {
 pub struct CliManager {
     pub progress: Arc<Mutex<UploadProgress>>,
     pub activities: Arc<Mutex<Vec<FileActivity>>>,
+    pub process_manager: Arc<ProcessManager>,
     paused: Arc<Mutex<bool>>,
     cancel_flag: Arc<Mutex<bool>>,
-}
-
-impl Default for CliManager {
-    fn default() -> Self {
-        Self {
-            progress: Arc::new(Mutex::new(UploadProgress::default())),
-            activities: Arc::new(Mutex::new(Vec::new())),
-            paused: Arc::new(Mutex::new(false)),
-            cancel_flag: Arc::new(Mutex::new(false)),
-        }
-    }
+    active_child: Arc<Mutex<Option<u32>>>,
 }
 
 impl CliManager {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(process_manager: Arc<ProcessManager>) -> Self {
+        Self {
+            progress: Arc::new(Mutex::new(UploadProgress::default())),
+            activities: Arc::new(Mutex::new(Vec::new())),
+            process_manager,
+            paused: Arc::new(Mutex::new(false)),
+            cancel_flag: Arc::new(Mutex::new(false)),
+            active_child: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub async fn is_paused(&self) -> bool {
@@ -84,6 +83,9 @@ impl CliManager {
 
     pub async fn request_cancel(&self) {
         *self.cancel_flag.lock().await = true;
+        if let Some(pid) = *self.active_child.lock().await {
+            process_manager::kill_process_tree(pid);
+        }
     }
 
     pub async fn reset_cancel(&self) {
@@ -92,6 +94,10 @@ impl CliManager {
 
     pub async fn should_cancel(&self) -> bool {
         *self.cancel_flag.lock().await
+    }
+
+    pub async fn is_upload_running(&self) -> bool {
+        self.progress.lock().await.is_running
     }
 
     async fn add_activity(&self, path: &str, status: FileStatus, message: Option<String>) {
@@ -122,7 +128,10 @@ fn resolve_cli_command(config: &AppConfig) -> Result<(String, Vec<String>)> {
     }
 
     if which_cli("npx") {
-        return Ok(("npx".to_string(), vec!["--yes".to_string(), "@immich/cli".to_string()]));
+        return Ok((
+            "npx".to_string(),
+            vec!["--yes".to_string(), "@immich/cli".to_string()],
+        ));
     }
 
     Err(anyhow!(
@@ -131,7 +140,7 @@ fn resolve_cli_command(config: &AppConfig) -> Result<(String, Vec<String>)> {
 }
 
 fn which_cli(name: &str) -> bool {
-    std::process::Command::new("where")
+    process_manager::hidden_command("where")
         .arg(name)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -216,7 +225,11 @@ async fn parse_line(line: &str, manager: &CliManager) {
         progress.completed_files += 1;
         drop(progress);
         manager
-            .add_activity(line, FileStatus::Skipped, Some("Duplicate or skipped".to_string()))
+            .add_activity(
+                line,
+                FileStatus::Skipped,
+                Some("Duplicate or skipped".to_string()),
+            )
             .await;
     } else if lower.contains("error") || lower.contains("fail") {
         let mut progress = manager.progress.lock().await;
@@ -246,13 +259,35 @@ async fn parse_line(line: &str, manager: &CliManager) {
     }
 }
 
-pub async fn run_login(app: &AppHandle, url: &str, api_key: &str) -> Result<String> {
+fn build_hidden_command(cmd: &str, args: &[String], env: &[(String, String)]) -> Command {
+    let mut command = Command::new(cmd);
+    command.args(args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.stdin(Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(process_manager::CREATE_NO_WINDOW);
+    }
+    command
+}
+
+pub async fn run_login(
+    manager: &CliManager,
+    url: &str,
+    api_key: &str,
+) -> Result<String> {
+    let _lock = manager
+        .process_manager
+        .acquire_cli_lock("login")
+        .map_err(|e| anyhow!(e))?;
+
     let config = config::load_config()?;
-    let (cmd, prefix) = resolve_cli_command(&config)?;
-
-    credentials::store_api_key(api_key)?;
-
-    let mut args = prefix;
+    let (cmd, mut args) = resolve_cli_command(&config)?;
     args.push("login".to_string());
     args.push(url.to_string());
     args.push(api_key.to_string());
@@ -261,16 +296,20 @@ pub async fn run_login(app: &AppHandle, url: &str, api_key: &str) -> Result<Stri
     env_pairs.push(("IMMICH_INSTANCE_URL".to_string(), url.to_string()));
     env_pairs.push(("IMMICH_API_KEY".to_string(), api_key.to_string()));
 
-    let output = run_command(app, &cmd, &args, &env_pairs).await?;
-    Ok(output)
+    run_command_once(manager, &cmd, &args, &env_pairs).await
 }
 
-pub async fn run_server_info(app: &AppHandle) -> Result<ServerInfo> {
+pub async fn run_server_info(manager: &CliManager) -> Result<ServerInfo> {
+    let _lock = manager
+        .process_manager
+        .acquire_cli_lock("server-info")
+        .map_err(|e| anyhow!(e))?;
+
     let config = config::load_config()?;
     let (cmd, mut prefix) = resolve_cli_command(&config)?;
     prefix.push("server-info".to_string());
     let env = build_env(&config)?;
-    let output = run_command(app, &cmd, &prefix, &env).await?;
+    let output = run_command_once(manager, &cmd, &prefix, &env).await?;
     let version = output
         .lines()
         .find(|l| l.contains("version") || l.contains("Version"))
@@ -287,6 +326,15 @@ pub async fn run_upload(
     manager: &CliManager,
     paths: Vec<String>,
 ) -> Result<String> {
+    if manager.is_upload_running().await {
+        return Err(anyhow!("An upload is already in progress"));
+    }
+
+    let _lock = manager
+        .process_manager
+        .acquire_cli_lock("upload")
+        .map_err(|e| anyhow!(e))?;
+
     manager.reset_cancel().await;
     {
         let mut progress = manager.progress.lock().await;
@@ -303,9 +351,7 @@ pub async fn run_upload(
     append_upload_args(&mut args, &config.upload_options, &paths);
 
     for path in &paths {
-        manager
-            .add_activity(path, FileStatus::Queued, None)
-            .await;
+        manager.add_activity(path, FileStatus::Queued, None).await;
     }
 
     let env = build_env(&config)?;
@@ -320,22 +366,29 @@ pub async fn run_upload(
     Ok(output)
 }
 
-async fn run_command(
-    app: &AppHandle,
+async fn run_command_once(
+    manager: &CliManager,
     cmd: &str,
     args: &[String],
     env: &[(String, String)],
 ) -> Result<String> {
-    let shell = app.shell();
-    let mut command = shell.command(cmd);
-    for arg in args {
-        command = command.arg(arg);
-    }
-    for (key, value) in env {
-        command = command.env(key, value);
+    let mut command = build_hidden_command(cmd, args, env);
+    let child = command
+        .spawn()
+        .context("Failed to spawn CLI process")?;
+
+    let pid = child.id();
+    if let Some(pid) = pid {
+        manager.process_manager.register_child_pid(pid);
+        *manager.active_child.lock().await = Some(pid);
     }
 
-    let output = command.output().await.context("Failed to execute CLI command")?;
+    let output = child.wait_with_output().await?;
+    if let Some(pid) = pid {
+        manager.process_manager.unregister_child_pid(pid);
+        *manager.active_child.lock().await = None;
+    }
+
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
@@ -351,23 +404,29 @@ async fn run_command_with_progress(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<String> {
-    let shell = app.shell();
-    let mut command = shell.command(cmd);
-    for arg in args {
-        command = command.arg(arg);
-    }
-    for (key, value) in env {
-        command = command.env(key, value);
-    }
-
-    let (mut rx, _child) = command
+    let mut command = build_hidden_command(cmd, args, env);
+    let mut child = command
         .spawn()
         .context("Failed to spawn CLI process")?;
 
-    let mut stdout = String::new();
+    if let Some(pid) = child.id() {
+        manager.process_manager.register_child_pid(pid);
+        *manager.active_child.lock().await = Some(pid);
+    }
 
-    while let Some(event) = rx.recv().await {
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture CLI stdout")?;
+    let stderr = child.stderr.take();
+    let mut reader = BufReader::new(stdout).lines();
+    let mut combined = String::new();
+
+    loop {
         if manager.should_cancel().await {
+            if let Some(pid) = child.id() {
+                process_manager::kill_process_tree(pid);
+            }
             break;
         }
 
@@ -378,26 +437,43 @@ async fn run_command_with_progress(
             }
         }
 
-        match event {
-            CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
-                let text = String::from_utf8_lossy(&line).to_string();
-                stdout.push_str(&text);
-                stdout.push('\n');
-                for l in text.lines() {
-                    parse_line(l, manager).await;
-                }
-                let _ = app.emit("upload-log", &text);
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                combined.push_str(&line);
+                combined.push('\n');
+                parse_line(&line, manager).await;
+                let _ = app.emit("upload-log", &line);
             }
-            CommandEvent::Terminated(payload) => {
-                if payload.code != Some(0) {
-                    return Err(anyhow!("Upload process exited with code {:?}", payload.code));
-                }
-            }
-            _ => {}
+            Ok(None) => break,
+            Err(e) => return Err(e.into()),
         }
     }
 
-    Ok(stdout)
+    if let Some(stderr) = stderr {
+        let mut err_reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = err_reader.next_line().await {
+            combined.push_str(&line);
+            combined.push('\n');
+            parse_line(&line, manager).await;
+            let _ = app.emit("upload-log", &line);
+        }
+    }
+
+    let status = child.wait().await?;
+    if let Some(pid) = child.id() {
+        manager.process_manager.unregister_child_pid(pid);
+        *manager.active_child.lock().await = None;
+    }
+
+    if manager.should_cancel().await {
+        return Err(anyhow!("Upload cancelled"));
+    }
+
+    if !status.success() {
+        return Err(anyhow!("Upload process exited with code {:?}", status.code()));
+    }
+
+    Ok(combined)
 }
 
 pub async fn detect_cli() -> Result<String> {

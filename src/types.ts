@@ -1,3 +1,16 @@
+export interface HandshakeResult {
+  success: boolean;
+  status_code: number;
+  server_version?: string | null;
+  message: string;
+}
+
+export interface DiscoveredServer {
+  name: string;
+  url: string;
+  source: string;
+}
+
 export interface UploadOptions {
   recursive: boolean;
   concurrency: number;

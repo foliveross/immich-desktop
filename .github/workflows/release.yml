@@ -2,8 +2,13 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write
@@ -11,19 +16,25 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Bump version and push tag
-        id: tag
-        uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch
-          tag_prefix: v
+      - name: Resolve release tag
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -34,7 +45,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust cache
+      - name: Cache Rust dependencies
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
@@ -42,11 +53,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Sync package version with tag
+      - name: Sync version with tag
         shell: bash
         run: |
-          VERSION="${{ steps.tag.outputs.new_tag }}"
-          VERSION="${VERSION#v}"
+          VERSION="${{ steps.version.outputs.version }}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           node -e "
             const fs = require('fs');
@@ -63,16 +73,44 @@ jobs:
             fs.writeFileSync(path, cargo);
           " "$VERSION"
 
+      - name: Validate build environment
+        run: node scripts/build-check.mjs
+
+      - name: Build frontend
+        run: npm run build
+
       - name: Build Tauri app
         run: npm run tauri build
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/release
+          PORTABLE="dist/release/ImmichDesktop-v${VERSION}.exe"
+          if [ -f "src-tauri/target/release/immich-desktop.exe" ]; then
+            cp "src-tauri/target/release/immich-desktop.exe" "$PORTABLE"
+          elif [ -f "src-tauri/target/release/ImmichDesktop.exe" ]; then
+            cp "src-tauri/target/release/ImmichDesktop.exe" "$PORTABLE"
+          else
+            echo "Portable exe not found" && exit 1
+          fi
+          NSIS=$(ls src-tauri/target/release/bundle/nsis/*.exe 2>/dev/null | head -1)
+          if [ -n "$NSIS" ]; then
+            cp "$NSIS" "dist/release/ImmichDesktop-Setup-v${VERSION}.exe"
+          fi
+          MSI=$(ls src-tauri/target/release/bundle/msi/*.msi 2>/dev/null | head -1)
+          if [ -n "$MSI" ]; then
+            cp "$MSI" "dist/release/ImmichDesktop-v${VERSION}.msi"
+          fi
+          ls -la dist/release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.new_tag }}
-          name: Release ${{ steps.tag.outputs.new_tag }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          fail_on_unmatched_files: false
           files: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/immich-desktop.exe
+            dist/release/*

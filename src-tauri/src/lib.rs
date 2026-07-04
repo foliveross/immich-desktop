@@ -1,17 +1,21 @@
 mod cli;
 mod commands;
 mod config;
+mod connection;
 mod credentials;
+mod discovery;
+mod process_manager;
 mod retry_queue;
 mod sync_triggers;
 mod watch;
 
 use commands::AppState;
+use process_manager::ProcessManager;
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Manager, RunEvent, WindowEvent,
 };
 use tauri_plugin_log::{Target, TargetKind};
 
@@ -26,16 +30,23 @@ pub fn run() {
                 file_name: Some("immich-desktop".to_string()),
             }),
         ]).build())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let cli_manager = Arc::new(cli::CliManager::new());
+            if let Err(msg) = ProcessManager::acquire_app_instance() {
+                log::error!("{msg}");
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+
+            let process_manager = Arc::new(ProcessManager::new());
+            let cli_manager = Arc::new(cli::CliManager::new(process_manager.clone()));
             let watch_service = Arc::new(watch::WatchService::new());
 
             app.manage(AppState {
                 cli_manager: cli_manager.clone(),
                 watch_service: watch_service.clone(),
+                process_manager: process_manager.clone(),
             });
 
             let pause = MenuItem::with_id(app, "pause", "Pause Sync", true, None::<&str>)?;
@@ -83,7 +94,7 @@ pub fn run() {
                     "open_ui" => {
                         if let Ok(cfg) = config::load_config() {
                             if let Some(url) = cfg.server_url {
-                                let web_url = url.replace("/api", "");
+                                let web_url = connection::web_url_from_api(&url);
                                 let _ = open::that(web_url);
                             }
                         }
@@ -98,6 +109,9 @@ pub fn run() {
                         }
                     }
                     "quit" => {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            state.process_manager.shutdown();
+                        }
                         app.exit(0);
                     }
                     _ => {}
@@ -142,9 +156,13 @@ pub fn run() {
             commands::save_app_config,
             commands::get_config_path,
             commands::get_logs_dir,
+            commands::get_lock_file_path,
             commands::has_stored_credentials,
             commands::store_credentials,
             commands::clear_credentials,
+            commands::discover_servers,
+            commands::perform_handshake,
+            commands::finalize_setup,
             commands::complete_setup,
             commands::test_connection,
             commands::detect_cli,
@@ -167,7 +185,15 @@ pub fn run() {
             commands::pick_upload_paths,
             commands::open_logs_folder,
             commands::open_config_folder,
+            commands::clear_cli_lock,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.process_manager.shutdown();
+                }
+            }
+        });
 }

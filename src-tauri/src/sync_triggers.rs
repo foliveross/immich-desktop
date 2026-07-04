@@ -1,8 +1,9 @@
 use crate::config::SyncTriggersConfig;
+use crate::process_manager;
 use anyhow::Result;
 use chrono::{Local, Timelike};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::process::Stdio;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncTriggerStatus {
@@ -54,8 +55,10 @@ pub fn evaluate_triggers(config: &SyncTriggersConfig) -> SyncTriggerStatus {
 }
 
 fn is_wifi_connected() -> bool {
-    let output = Command::new("netsh")
+    let output = process_manager::hidden_command("netsh")
         .args(["wlan", "show", "interfaces"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output();
 
     match output {
@@ -72,8 +75,10 @@ fn is_on_allowed_network(config: &SyncTriggersConfig) -> bool {
         return true;
     }
 
-    let output = Command::new("netsh")
+    let output = process_manager::hidden_command("netsh")
         .args(["wlan", "show", "interfaces"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output();
 
     match output {
@@ -89,12 +94,14 @@ fn is_on_allowed_network(config: &SyncTriggersConfig) -> bool {
 }
 
 fn is_plugged_in() -> bool {
-    let output = Command::new("powershell")
+    let output = process_manager::hidden_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
             "(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue) -eq $null -or (Get-CimInstance -ClassName Win32_Battery).BatteryStatus -in 2,3,6,7,8,9",
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output();
 
     match output {
@@ -124,8 +131,9 @@ fn is_within_schedule(schedule: &crate::config::ScheduleConfig) -> bool {
 }
 
 pub fn get_current_network_name() -> Result<Option<String>> {
-    let output = Command::new("netsh")
+    let output = process_manager::hidden_command("netsh")
         .args(["wlan", "show", "interfaces"])
+        .stdout(Stdio::piped())
         .output()?;
 
     let text = String::from_utf8_lossy(&output.stdout);

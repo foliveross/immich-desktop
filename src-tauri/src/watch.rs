@@ -9,17 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+use tokio::time::{sleep_until, Instant};
 
 pub struct WatchService {
     watcher: SyncMutex<Option<RecommendedWatcher>>,
-    debounce_paths: Arc<SyncMutex<Vec<String>>>,
 }
 
 impl WatchService {
     pub fn new() -> Self {
         Self {
             watcher: SyncMutex::new(None),
-            debounce_paths: Arc::new(SyncMutex::new(Vec::new())),
         }
     }
 
@@ -41,7 +40,6 @@ impl WatchService {
 
         let debounce_ms = config.watch_mode.debounce_ms;
         let folders = config.watch_folders.clone();
-        let _debounce_paths = self.debounce_paths.clone();
 
         let (tx, mut rx) = mpsc::channel::<String>(256);
 
@@ -75,15 +73,25 @@ impl WatchService {
         let manager = cli_manager.clone();
         tokio::spawn(async move {
             let mut pending: Vec<String> = Vec::new();
+            let mut deadline = Instant::now() + Duration::from_millis(debounce_ms);
+
             loop {
                 tokio::select! {
                     Some(path) = rx.recv() => {
                         if !pending.contains(&path) {
                             pending.push(path);
                         }
+                        deadline = Instant::now() + Duration::from_millis(debounce_ms);
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {
+                    _ = sleep_until(deadline) => {
                         if pending.is_empty() {
+                            deadline = Instant::now() + Duration::from_millis(debounce_ms);
+                            continue;
+                        }
+
+                        if manager.progress.lock().await.is_running {
+                            log::debug!("Watch upload deferred — upload already in progress");
+                            deadline = Instant::now() + Duration::from_millis(debounce_ms);
                             continue;
                         }
 
@@ -92,6 +100,7 @@ impl WatchService {
                         if !triggers.can_sync {
                             let _ = app_clone.emit("watch-blocked", &triggers);
                             pending.clear();
+                            deadline = Instant::now() + Duration::from_millis(debounce_ms);
                             continue;
                         }
 
@@ -102,6 +111,8 @@ impl WatchService {
                             log::error!("Watch upload failed: {e}");
                             let _ = app_clone.emit("watch-error", e.to_string());
                         }
+
+                        deadline = Instant::now() + Duration::from_millis(debounce_ms);
                     }
                 }
             }

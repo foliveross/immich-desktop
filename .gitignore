@@ -16,7 +16,7 @@ auth.yml
 config.json
 credentials.json
 **/retry_queue.json
-**/conflicts.json
+immich-desktop.lock
 
 # Tauri build output
 src-tauri/target/
